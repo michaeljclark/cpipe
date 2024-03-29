@@ -33,7 +33,6 @@ typedef unsigned long long ullong;
  */
 
 typedef struct io_span io_span;
-typedef struct io_buffer_impl io_buffer_impl;
 typedef struct io_buffer_ops io_buffer_ops;
 typedef struct io_buffer io_buffer;
 
@@ -44,12 +43,12 @@ struct io_span
     size_t sequence;
 };
 
-typedef size_t (io_read_fn)(io_buffer_impl *impl, char *buf, size_t len);
-typedef size_t (io_write_fn)(io_buffer_impl *impl, char *buf, size_t len);
-typedef io_span (io_read_lock_fn)(io_buffer_impl *impl, size_t len);
-typedef io_span (io_write_lock_fn)(io_buffer_impl *impl, size_t len);
-typedef int (io_read_commit_fn)(io_buffer_impl *impl, io_span ticket);
-typedef int (io_write_commit_fn)(io_buffer_impl *impl, io_span ticket);
+typedef size_t (io_read_fn)(io_buffer *io, char *buf, size_t len);
+typedef size_t (io_write_fn)(io_buffer *io, char *buf, size_t len);
+typedef io_span (io_read_lock_fn)(io_buffer *io, size_t len);
+typedef io_span (io_write_lock_fn)(io_buffer *io, size_t len);
+typedef int (io_read_commit_fn)(io_buffer *io, io_span ticket);
+typedef int (io_write_commit_fn)(io_buffer *io, io_span ticket);
 
 struct io_buffer_ops
 {
@@ -63,38 +62,37 @@ struct io_buffer_ops
 
 struct io_buffer
 {
-    io_buffer_impl *impl;
     io_buffer_ops *ops;
 };
 
 static size_t io_buffer_read(io_buffer *io, char *buf, size_t len)
 {
-    return io->ops->read(io->impl, buf, len); 
+    return io->ops->read(io, buf, len); 
 }
 
 static size_t io_buffer_write(io_buffer *io, char *buf, size_t len)
 {
-    return io->ops->write(io->impl, buf, len); 
+    return io->ops->write(io, buf, len); 
 }
 
 static io_span io_buffer_read_lock(io_buffer *io, size_t len)
 {
-    return io->ops->read_lock(io->impl, len); 
+    return io->ops->read_lock(io, len); 
 }
 
 static io_span io_buffer_write_lock(io_buffer *io, size_t len)
 {
-    return io->ops->write_lock(io->impl, len); 
+    return io->ops->write_lock(io, len); 
 }
 
 static int io_buffer_read_commit(io_buffer *io, io_span ticket)
 {
-    return io->ops->read_commit(io->impl, ticket); 
+    return io->ops->read_commit(io, ticket); 
 }
 
 static int io_buffer_write_commit(io_buffer *io, io_span ticket)
 {
-    return io->ops->write_commit(io->impl, ticket); 
+    return io->ops->write_commit(io, ticket); 
 }
 
 /*
@@ -163,7 +161,6 @@ static void pipe_buffer_init(pipe_buffer *pb, size_t capacity)
     assert(ispow2(capacity));
     assert(capacity < (1 << (sizeof(pb_uoffset) << 3)));
     pb_offsets pbo = { 0 };
-    pb->io.impl = (io_buffer_impl*)pb;
     pb->io.ops = &pb_ops;
     pb->pof = pb_pack_offsets(pbo);
     pb->capacity = capacity;
