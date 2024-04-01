@@ -1,4 +1,5 @@
 #undef NDEBUG
+#include <stdio.h>
 #include <assert.h>
 
 #include "buffer.h"
