@@ -129,7 +129,7 @@ struct pipe_buffer
     io_buffer io;
     atomic_size_t capacity;
     char *data;
-    size_t _pad[4];
+    size_t _pad[5];
     atomic_ullong pof;
 };
 
