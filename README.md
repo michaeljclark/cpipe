@@ -39,6 +39,40 @@ ________________--------XXXXXXXXXXXXXXXX++++++++________________
 XXXXXXXXXXXXXXXX++++++++________________--------XXXXXXXXXXXXXXXX
 ```
 
+## Performance
+
+Benchmarks have been run on Windows 11 and Ubuntu 22.04 with Kaby Lake
+and Skylake processors. See [Windows benchmarks](BENCH-Windows.md) and
+[Linux benchmarks](BENCH-Linux.md) for details.
+
+### Minimum Latency (nanoseconds)
+
+|                      | cpipe win11 | cpipe linux | linux pipes |
+|:---------------------|------------:|------------:|------------:|
+| Kaby Lake (i7-8550U) |      ~219ns |      ~362ns |     ~7692ns |
+| Skylake (i9-7980XE)  |      ~404ns |      ~425ns |     ~9183ns |
+
+### Message Rate (messages per second)
+
+|                      | cpipe win11 | cpipe linux | linux pipes |
+|:---------------------|------------:|------------:|------------:|
+| Kaby Lake (i7-8550U) |       4.55M |       2.71M |     129.62K |
+| Skylake (i9-7980XE)  |       2.47M |       2.35M |     108.89K |
+
+### Bandwidth 32KB buffer (1-thread)
+
+|                      | cpipe win11 | cpipe linux | linux pipes |
+|:---------------------|------------:|------------:|------------:|
+| Kaby Lake (i7-8550U) |  2.91GB/sec |  1.36GB/sec |  1.72GB/sec |
+| Skylake (i9-7980XE)  |  2.98GB/sec |  1.44GB/sec |  1.67GB/sec |
+
+### Bandwidth 32KB buffer (4-threads)
+
+|                      | cpipe win11 | cpipe linux |
+|:---------------------|------------:|------------:|
+| Kaby Lake (i7-8550U) |  5.56GB/sec |  0.79GB/sec |
+| Skylake (i9-7980XE)  |  7.11GB/sec |  0.89GB/sec |
+
 ## Build instructions
 
 cpipe builds have been tested using CMake on the following platforms:
