@@ -101,8 +101,9 @@ void io_run_test(int bufsize)
 
 int main(int argc, const char **argv)
 {
-    printf("\n%s: %d write thread(s), %d read thread(s)\n",
+    printf("\n# %s: %d write thread(s) %d read thread(s)\n",
         "test_002_pipe_buffer", NTHREAD, NTHREAD);
+    printf("# os: %s cpu: %s\n", get_os_name(), get_cpu_name());
 
     io_run_test(4);
     io_run_test(16);

@@ -1,5 +1,27 @@
 #pragma once
 
+#if defined __GNUC__ && (defined __i386__ || defined __x86_64__)
+#define HAS_X86_CPUID 1
+#include <cpuid.h>
+static inline void __x86_cpuidex(int reg[], int level, int count)
+{ __cpuid_count(level, count, reg[0], reg[1], reg[2], reg[3]); }
+#elif defined _MSC_VER && (defined _M_IX86 || defined _M_X64)
+#define HAS_X86_CPUID 1
+#define __x86_cpuidex __cpuidex
+#endif
+
+#if defined __APPLE__
+static inline const char* get_os_name() { return "macOS"; }
+#elif defined __linux__
+static inline const char* get_os_name() { return "Linux"; }
+#elif defined __FreeBSD__
+static inline const char* get_os_name() { return "FreeBSD"; }
+#elif defined _WIN32
+static inline const char* get_os_name() { return "Windows"; }
+#else
+static inline const char* get_os_name() { return "unknown"; }
+#endif
+
 typedef struct test_state test_state;
 struct test_state
 {
@@ -7,6 +29,30 @@ struct test_state
     size_t bufsize, count, wsum, rsum, wops, rops, werrs, rerrs;
     clock_t wstart, wend, rstart, rend;
 };
+
+#if HAS_X86_CPUID
+static inline const char* get_cpu_name()
+{
+    int leaf_0[4], leaf_2[4], leaf_3[4], leaf_4[4];
+    static char cpu_name[64] = "unknown";
+
+    __x86_cpuidex(leaf_0, 0x80000000, 0);
+
+    if (leaf_0[0] >= 0x80000004)
+    {
+        __x86_cpuidex(leaf_2, 0x80000002, 0);
+        __x86_cpuidex(leaf_3, 0x80000003, 0);
+        __x86_cpuidex(leaf_4, 0x80000004, 0);
+        memcpy(cpu_name + 0x00, leaf_2, 0x10);
+        memcpy(cpu_name + 0x10, leaf_3, 0x10);
+        memcpy(cpu_name + 0x20, leaf_4, 0x10);
+    }
+
+    return cpu_name;
+}
+#else
+static inline const char* get_cpu_name() { return "unknown"; }
+#endif
 
 static void io_print_results(test_state s, int nloop)
 {
