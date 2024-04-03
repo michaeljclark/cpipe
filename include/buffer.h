@@ -219,7 +219,7 @@ retry:
         pof.start_mark, io_len, new_start_mark);
 
     /* compare swap start_mark <- new_start_mark. requires compare swap
-     * due to buffer space invariant. uncontended if one reader. */
+     * due to buffer space invariant. uncontended if one reader/writer. */
     pof.start_mark = new_start_mark;
     if (!atomic_compare_exchange_strong(&pb->pof, &pof_val,
         pb_pack_offsets(pof))) goto retry;
@@ -236,7 +236,7 @@ retry:
     }
 
     /* spin until start == start_mark for reads before us to complete
-     * and store start <- new_start_mark. uncontended if one reader. */
+     * and store start <- new_start_mark. uncontended if one reader/writer. */
     for (;;) {
         pof_val = atomic_load_explicit(&pb->pof, memory_order_acquire);
         pof = pb_unpack_offsets(pof_val);
@@ -292,7 +292,7 @@ retry:
         pof.end_mark, io_len, new_end_mark);
 
     /* compare swap end_mark <- new_end_mark. requires compare swap
-     * due to buffer space invariant. uncontended if one writer. */
+     * due to buffer space invariant. uncontended if one reader/writer. */
     pof.end_mark = new_end_mark;
     if (!atomic_compare_exchange_strong(&pb->pof, &pof_val,
         pb_pack_offsets(pof))) goto retry;
@@ -309,7 +309,7 @@ retry:
     }
 
     /* spin until end == end_mark for writes before us to complete
-     * and store end <- new_end_mark. uncontended if one writer. */
+     * and store end <- new_end_mark. uncontended if one reader/writer. */
     for (;;) {
         pof_val = atomic_load_explicit(&pb->pof, memory_order_acquire);
         pof = pb_unpack_offsets(pof_val);
@@ -371,7 +371,7 @@ retry:
         pof.start_mark, io_len, new_start_mark);
 
     /* compare swap start_mark <- new_start_mark. requires compare swap
-     * due to buffer space invariant. uncontended if one reader. */
+     * due to buffer space invariant. uncontended if one reader/writer. */
     pof.start_mark = new_start_mark;
     if (!atomic_compare_exchange_strong(&pb->pof, &pof_val,
         pb_pack_offsets(pof))) goto retry;
@@ -430,7 +430,7 @@ retry:
         pof.end_mark, io_len, new_end_mark);
 
     /* compare swap end_mark <- new_end_mark. requires compare swap
-     * due to buffer space invariant. uncontended if one writer. */
+     * due to buffer space invariant. uncontended if one reader/writer. */
     pof.end_mark = new_end_mark;
     if (!atomic_compare_exchange_strong(&pb->pof, &pof_val,
         pb_pack_offsets(pof))) goto retry;
@@ -454,7 +454,7 @@ static int pipe_buffer_read_commit(pipe_buffer *pb, io_span ticket)
     new_start_mark = (pb_uoffset)(ticket.sequence + ticket.length);
 
     /* spin until start == start_mark for reads before us to complete
-     * and store start <- new_start_mark. uncontended if one reader. */
+     * and store start <- new_start_mark. uncontended if one reader/writer. */
     for (;;) {
         pof_val = atomic_load_explicit(&pb->pof, memory_order_acquire);
         pof = pb_unpack_offsets(pof_val);
@@ -481,7 +481,7 @@ static int pipe_buffer_write_commit(pipe_buffer *pb, io_span ticket)
     new_end_mark = (pb_uoffset)(ticket.sequence + ticket.length);
 
     /* spin until end == end_mark for writes before us to complete
-     * and store end <- new_end_mark. uncontended if one writer. */
+     * and store end <- new_end_mark. uncontended if one reader/writer. */
     for (;;) {
         pof_val = atomic_load_explicit(&pb->pof, memory_order_acquire);
         pof = pb_unpack_offsets(pof_val);

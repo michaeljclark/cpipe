@@ -26,8 +26,9 @@ that empty and full conditions can be distinguished by distances between
 start and end markers, along with math that supports graceful overflow.
 The read and write primitives calculate a read ahead or write ahead mark
 consistent with the buffer space invariant then atomically take a ticket
-for a read ahead or write ahead mark, perform copies, then atomically
-commit the new start or end mark, spinning to retire in order.
+for the new read ahead or write ahead mark, perform buffer copies or
+computation on an array, then atomically commit the new start or end
+mark to the current start or end, spinning to retire in order.
 
 ### Concurrent locks
 
@@ -45,8 +46,8 @@ in parallel as the operations should complete at the same time.
 
 #### Counters
 
-A single locked operation contains _four variables_: _start, start_mark,
-end, end_mark_ where the last two indicate the current read ahead and
+A single locked operation updates _four counters_: _start, end, start_mark,
+and end_mark_ where the last two indicate the current read ahead and
 write ahead limits. This is because the buffer space and order invariant
 for buffer operation are predicated on all four variables to guarantee
 concurrent operations on the pipe buffer can be performed in parallel.
