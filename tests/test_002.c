@@ -26,7 +26,7 @@ static int io_write_thread(void* arg)
     for (size_t j = 0; j < NLOOP; j++) {
         uint seq = 0;
         for (size_t i = 0, l = 0; i < count;) {
-            for (; l < count && l < i + bufsize; l++) {
+            for (; l < count && l < i + (bufsize>>2); l++) {
                 seq = seq * 793517 + (int)l;
                 sum += (arr[l] = seq);
             }
