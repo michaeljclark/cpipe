@@ -24,8 +24,6 @@
 
 #include "bits.h"
 
-typedef struct pipe_buffer pipe_buffer;
-
 typedef unsigned long long ullong;
 
 /*
@@ -115,6 +113,7 @@ static int io_buffer_write_commit(io_buffer *io, io_span ticket)
 typedef ushort pb_uoffset;
 typedef atomic_ushort atomic_pb_uoffset;
 typedef struct pb_offsets pb_offsets;
+typedef struct pipe_buffer pipe_buffer;
 
 struct pb_offsets
 {
