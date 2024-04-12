@@ -70,12 +70,12 @@ static int io_read_thread(void* arg)
 
 static void io_run_test(int bufsize)
 {
-    pipe_buffer pb;
+    pbm_buffer pb;
     test_state s[NTHREAD], t;
     thrd_t w_tid[NTHREAD], r_tid[NTHREAD];
     int r, res;
 
-    pipe_buffer_init(&pb, bufsize);
+    pbm_buffer_init(&pb, bufsize);
 
     for (size_t i = 0; i < NTHREAD; i++) {
         memset(&s[i], 0, sizeof(test_state));
@@ -98,7 +98,7 @@ static void io_run_test(int bufsize)
         assert(r == 0);
     }
 
-    pipe_buffer_destroy(&pb);
+    pbm_buffer_destroy(&pb);
 
     memset(&t, 0, sizeof(test_state));
     t.bufsize = bufsize;
@@ -125,7 +125,7 @@ static void io_run_test(int bufsize)
 int main(int argc, const char **argv)
 {
     printf("\n# %s: %d write thread(s) %d read thread(s)\n",
-        "test_003_pipe_buffer", NTHREAD, NTHREAD);
+        "test_003_pbm_buffer", NTHREAD, NTHREAD);
     printf("# os: %s cpu: %s\n", get_os_name(), get_cpu_name());
 
     io_run_test(4);

@@ -26,7 +26,7 @@ static int io_write_thread(void* arg)
     for (size_t j = 0; j < NLOOP; j++) {
         uint seq = 0;
         for (size_t i = 0, l = 0; i < count;) {
-            for (; l < count && l < i + (bufsize>>2); l++) {
+            for (; l < count && l < i + bufsize; l++) {
                 seq = seq * 793517 + (int)l;
                 sum += (arr[l] = seq);
             }
@@ -70,12 +70,12 @@ static int io_read_thread(void* arg)
 
 void io_run_test(int bufsize)
 {
-    pbm_buffer pb;
+    pbs_buffer pb;
     test_state s;
     thrd_t w_tid, r_tid;
     int r, res;
 
-    pbm_buffer_init(&pb, bufsize);
+    pbs_buffer_init(&pb, bufsize);
 
     memset(&s, 0, sizeof(test_state));
     s.bufsize = bufsize;
@@ -92,7 +92,7 @@ void io_run_test(int bufsize)
     r = thrd_join(r_tid, &res);
     assert(r == 0);
 
-    pbm_buffer_destroy(&pb);
+    pbs_buffer_destroy(&pb);
 
     io_print_results(s, NLOOP);
 
@@ -102,7 +102,7 @@ void io_run_test(int bufsize)
 int main(int argc, const char **argv)
 {
     printf("\n# %s: %d write thread(s) %d read thread(s)\n",
-        "test_002_pbm_buffer", NTHREAD, NTHREAD);
+        "test_005_pbs_buffer", NTHREAD, NTHREAD);
     printf("# os: %s cpu: %s\n", get_os_name(), get_cpu_name());
 
     io_run_test(4);

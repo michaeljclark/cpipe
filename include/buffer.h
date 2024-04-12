@@ -94,10 +94,7 @@ static int io_buffer_write_commit(io_buffer *io, io_span ticket)
 }
 
 /*
- * pipe buffer
- *
- * pipe buffer is a power of two sized circular buffer that provides
- * multithreaded read/write using read ahead and write ahead pointers.
+ * pipe buffer debug
  */
 
 //#define DEBUG
@@ -110,20 +107,311 @@ static int io_buffer_write_commit(io_buffer *io, io_span ticket)
 #define pb_debugf(fmt,...)
 #endif
 
-typedef ushort pb_uoffset;
-typedef atomic_ushort atomic_pb_uoffset;
-typedef struct pb_offsets pb_offsets;
-typedef struct pipe_buffer pipe_buffer;
+/*
+ * single producer single consumer pipe buffer
+ *
+ * pipe buffer is a power of two sized circular buffer that provides
+ * single-threaded read/write using read ahead and write ahead pointers.
+ */
 
-struct pb_offsets
+typedef ullong pbs_uoffset;
+typedef atomic_ullong atomic_pbs_uoffset;
+typedef struct pbs_buffer pbs_buffer;
+
+struct pbs_buffer
 {
-    pb_uoffset start;
-    pb_uoffset start_mark;
-    pb_uoffset end;
-    pb_uoffset end_mark;
+    io_buffer io;
+    atomic_size_t capacity;
+    char *data;
+    atomic_pbs_uoffset start;
+    atomic_pbs_uoffset end;
 };
 
-struct pipe_buffer
+static io_buffer_ops pbs_ops;
+
+static void pbs_buffer_init(pbs_buffer *pb, size_t capacity)
+{
+    assert(ispow2(capacity));
+    pb->io.ops = &pbs_ops;
+    pb->start = 0;
+    pb->end = 0;
+    pb->capacity = capacity;
+    pb->data = (char*)malloc(capacity);
+    memset(pb->data, 0, capacity);
+}
+
+static void pbs_buffer_destroy(pbs_buffer *pb)
+{
+    free(pb->data);
+    pb->data = NULL;
+}
+
+static size_t pbs_buffer_capacity(pbs_buffer *pb)
+{
+    return pb->capacity;
+}
+
+static size_t pbs_buffer_read(pbs_buffer *pb, char *buf, size_t len)
+{
+    pbs_uoffset cap, mask, csz, io_len, start, new_start, end;
+
+    /*                  start                   end                       *
+     *                  |       start           |       end               *
+     *  ________________--------XXXXXXXXXXXXXXXX++++++++________________  *
+     *                                                                    *
+     *                  end+cap                 start                     *
+     *                  |       end+cap         |       start             *
+     *  XXXXXXXXXXXXXXXX++++++++________________--------XXXXXXXXXXXXXXXX  */
+
+    if (len == 0) return 0;
+
+    cap = (pbs_uoffset)atomic_load_explicit(&pb->capacity, memory_order_relaxed);
+    mask = cap - 1;
+
+    /* fetch buffer markers */
+    start = atomic_load_explicit(&pb->start, memory_order_acquire);
+    end = atomic_load_explicit(&pb->end, memory_order_relaxed);
+
+    /* ensure buffer marker invariants */
+    csz = end - start;
+    assert(csz <= cap);
+
+    /* calculate copy length from start to new_start */
+    io_len = len < csz ? (pbs_uoffset)len : csz;
+    start = start;
+    new_start = start + io_len;
+
+    if (io_len == 0) return 0;
+
+    pb_debugf("start=%u io_len=%u new_start=%u",
+        start, io_len, new_start);
+
+    /* perform copy out, and if we wrap split into two copies
+     * while also applying the modulus to the buffer markers. */
+    if ((start & ~mask) == ((new_start - 1) & ~mask)) {
+        memcpy(buf, pb->data + (start & mask), io_len);
+    } else {
+        pbs_uoffset o1 = (start & mask);
+        pbs_uoffset l1 = (new_start & ~mask) - start;
+        memcpy(buf, pb->data + o1, l1);
+        memcpy(buf + l1, pb->data, io_len - l1);
+    }
+
+    /* store start <- new_start. */
+    atomic_store_explicit(&pb->start, new_start, memory_order_release);
+
+    return io_len;
+}
+
+static size_t pbs_buffer_write(pbs_buffer *pb, char *buf, size_t len)
+{
+    pbs_uoffset cap, mask, csz, io_len, start, end, new_end;
+
+    /*                  start                   end                       *
+     *                  |       start           |       end               *
+     *  ________________--------XXXXXXXXXXXXXXXX++++++++________________  *
+     *                                                                    *
+     *                  end+cap                 start                     *
+     *                  |       end+cap         |       start             *
+     *  XXXXXXXXXXXXXXXX++++++++________________--------XXXXXXXXXXXXXXXX  */
+
+    if (len == 0) return 0;
+
+    cap = (pbs_uoffset)atomic_load_explicit(&pb->capacity, memory_order_relaxed);
+    mask = cap - 1;
+
+    /* fetch buffer markers */
+    start = atomic_load_explicit(&pb->start, memory_order_relaxed);
+    end = atomic_load_explicit(&pb->end, memory_order_acquire);
+
+    /* ensure buffer marker invariants */
+    csz = end - start;
+    assert(csz <= cap);
+
+    /* calculate copy length from end to new_end */
+    io_len = len < cap - csz ? (pbs_uoffset)len : cap - csz;
+    end = end;
+    new_end = end + io_len;
+
+    if (io_len == 0) return 0;
+
+    pb_debugf("end=%u io_len=%u new_end=%u",
+        end, io_len, new_end);
+
+    /* perform copy in, and if we wrap split into two copies
+     * while also applying the modulus to the buffer markers. */
+    if ((end & ~mask) == ((new_end - 1) & ~mask)) {
+        memcpy(pb->data + (end & mask), buf, io_len);
+    } else {
+        pbs_uoffset o1 = (end & mask);
+        pbs_uoffset l1 = (new_end & ~mask) - end;
+        memcpy(pb->data + o1, buf, l1);
+        memcpy(pb->data, buf + l1, io_len - l1);
+    }
+
+    /* store end <- new_end. */
+    atomic_store_explicit(&pb->end, new_end, memory_order_release);
+
+    return io_len;
+}
+
+static io_span pbs_buffer_read_lock(pbs_buffer *pb, size_t len)
+{
+    pbs_uoffset cap, mask, csz, io_len, start, new_start, end;
+    io_span ticket = { 0, 0, 0 };
+
+    /*                  start                   end                       *
+     *                  |       start           |       end               *
+     *  ________________--------XXXXXXXXXXXXXXXX++++++++________________  *
+     *                                                                    *
+     *                  end+cap                 start                     *
+     *                  |       end+cap         |       start             *
+     *  XXXXXXXXXXXXXXXX++++++++________________--------XXXXXXXXXXXXXXXX  */
+
+    if (len == 0) return ticket;
+
+    cap = (pbs_uoffset)atomic_load_explicit(&pb->capacity, memory_order_relaxed);
+    mask = cap - 1;
+
+    /* fetch buffer markers */
+    start = atomic_load_explicit(&pb->start, memory_order_acquire);
+    end = atomic_load_explicit(&pb->end, memory_order_relaxed);
+
+    /* ensure buffer marker invariants */
+    csz = end - start;
+    assert(csz <= cap);
+
+    /* calculate copy length from start to new_start */
+    io_len = len < csz ? (pbs_uoffset)len : csz;
+    start = start;
+    new_start = start + io_len;
+
+    if ((start & ~mask) != ((new_start - 1) & ~mask)) {
+        io_len = (new_start & ~mask) - start;
+        new_start = start + io_len;
+    }
+
+    if (io_len == 0) return ticket;
+
+    pb_debugf("start=%u io_len=%u new_start=%u",
+        start, io_len, new_start);
+
+    ticket.buf = pb->data + (start & mask);
+    ticket.length = io_len;
+    ticket.sequence = start;
+
+    return ticket;
+}
+
+static io_span pbs_buffer_write_lock(pbs_buffer *pb, size_t len)
+{
+    pbs_uoffset cap, mask, csz, io_len, start, end, new_end;
+    io_span ticket = { 0, 0, 0 };
+
+    /*                  start                   end                       *
+     *                  |       start           |       end               *
+     *  ________________--------XXXXXXXXXXXXXXXX++++++++________________  *
+     *                                                                    *
+     *                  end+cap                 start                     *
+     *                  |       end+cap         |       start             *
+     *  XXXXXXXXXXXXXXXX++++++++________________--------XXXXXXXXXXXXXXXX  */
+
+    if (len == 0) return ticket;
+
+    cap = (pbs_uoffset)atomic_load_explicit(&pb->capacity, memory_order_relaxed);
+    mask = cap - 1;
+
+    /* fetch buffer markers */
+    start = atomic_load_explicit(&pb->start, memory_order_relaxed);
+    end = atomic_load_explicit(&pb->end, memory_order_acquire);
+
+    /* ensure buffer marker invariants */
+    csz = end - start;
+    assert(csz <= cap);
+
+    /* calculate copy length from end to new_end */
+    io_len = len < cap - csz ? (pbs_uoffset)len : cap - csz;
+    end = end;
+    new_end = end + io_len;
+
+    if ((end & ~mask) != ((new_end - 1) & ~mask)) {
+        io_len = (new_end & ~mask) - end;
+        new_end = end + io_len;
+    }
+
+    if (io_len == 0) return ticket;
+
+    pb_debugf("end=%u io_len=%u new_end=%u",
+        end, io_len, new_end);
+
+    ticket.buf = pb->data + (end & mask);
+    ticket.length = io_len;
+    ticket.sequence = end;
+
+    return ticket;
+}
+
+static int pbs_buffer_read_commit(pbs_buffer *pb, io_span ticket)
+{
+    pbs_uoffset start, new_start;
+
+    if (ticket.length == 0) return 0;
+
+    start = (pbs_uoffset)ticket.sequence;
+    new_start = (pbs_uoffset)(ticket.sequence + ticket.length);
+
+    /* store start <- new_start. */
+    atomic_store_explicit(&pb->start, new_start, memory_order_release);
+
+    return 0;
+}
+
+static int pbs_buffer_write_commit(pbs_buffer *pb, io_span ticket)
+{
+    pbs_uoffset end, new_end;
+
+    if (ticket.length == 0) return 0;
+
+    end = (pbs_uoffset)ticket.sequence;
+    new_end = (pbs_uoffset)(ticket.sequence + ticket.length);
+
+    /* store end <- new_end. */
+    atomic_store_explicit(&pb->end, new_end, memory_order_release);
+
+    return 0;
+}
+
+static io_buffer_ops pbs_ops =
+{
+    (io_read_fn *)pbs_buffer_read,
+    (io_write_fn *)pbs_buffer_write,
+    (io_read_lock_fn *)pbs_buffer_read_lock,
+    (io_write_lock_fn *)pbs_buffer_write_lock,
+    (io_read_commit_fn *)pbs_buffer_read_commit,
+    (io_write_commit_fn *)pbs_buffer_write_commit
+};
+
+/*
+ * multiple producer multiple consumer pipe buffer
+ *
+ * pipe buffer is a power of two sized circular buffer that provides
+ * multi-threaded read/write using read ahead and write ahead pointers.
+ */
+
+typedef ushort pbm_uoffset;
+typedef atomic_ushort atomic_pbm_uoffset;
+typedef struct pbm_offsets pbm_offsets;
+typedef struct pbm_buffer pbm_buffer;
+
+struct pbm_offsets
+{
+    pbm_uoffset start;
+    pbm_uoffset start_mark;
+    pbm_uoffset end;
+    pbm_uoffset end_mark;
+};
+
+struct pbm_buffer
 {
     io_buffer io;
     atomic_size_t capacity;
@@ -132,9 +420,9 @@ struct pipe_buffer
     atomic_ullong pof;
 };
 
-static io_buffer_ops pb_ops;
+static io_buffer_ops pbm_ops;
 
-static ullong pb_pack_offsets(pb_offsets pbo)
+static ullong pbm_pack_offsets(pbm_offsets pbo)
 {
     ullong mask = ((1ull << 16) - 1);
     return ((pbo.start & mask) << 0) |
@@ -143,46 +431,46 @@ static ullong pb_pack_offsets(pb_offsets pbo)
         ((pbo.end_mark & mask) << 48);
 }
 
-static pb_offsets pb_unpack_offsets(ullong pof)
+static pbm_offsets pbm_unpack_offsets(ullong pof)
 {
     ullong mask = ((1ull << 16) - 1);
-    pb_offsets pbo = {
-        (pb_uoffset)((pof >> 0) & mask),
-        (pb_uoffset)((pof >> 16) & mask),
-        (pb_uoffset)((pof >> 32) & mask),
-        (pb_uoffset)((pof >> 48) & mask)
+    pbm_offsets pbo = {
+        (pbm_uoffset)((pof >> 0) & mask),
+        (pbm_uoffset)((pof >> 16) & mask),
+        (pbm_uoffset)((pof >> 32) & mask),
+        (pbm_uoffset)((pof >> 48) & mask)
     };
     return pbo;
 }
 
-static void pipe_buffer_init(pipe_buffer *pb, size_t capacity)
+static void pbm_buffer_init(pbm_buffer *pb, size_t capacity)
 {
     assert(ispow2(capacity));
-    assert(capacity < (1 << (sizeof(pb_uoffset) << 3)));
-    pb_offsets pbo = { 0 };
-    pb->io.ops = &pb_ops;
-    pb->pof = pb_pack_offsets(pbo);
+    assert(capacity < (1ull << (sizeof(pbm_uoffset) << 3)));
+    pbm_offsets pbo = { 0 };
+    pb->io.ops = &pbm_ops;
+    pb->pof = pbm_pack_offsets(pbo);
     pb->capacity = capacity;
     pb->data = (char*)malloc(capacity);
     memset(pb->data, 0, capacity);
 }
 
-static void pipe_buffer_destroy(pipe_buffer *pb)
+static void pbm_buffer_destroy(pbm_buffer *pb)
 {
     free(pb->data);
     pb->data = NULL;
 }
 
-static size_t pipe_buffer_capacity(pipe_buffer *pb)
+static size_t pbm_buffer_capacity(pbm_buffer *pb)
 {
     return pb->capacity;
 }
 
-static size_t pipe_buffer_read(pipe_buffer *pb, char *buf, size_t len)
+static size_t pbm_buffer_read(pbm_buffer *pb, char *buf, size_t len)
 {
     ullong pof_val;
-    pb_offsets pof;
-    pb_uoffset cap, mask, csz, fsz, io_len, start_mark, new_start_mark;
+    pbm_offsets pof;
+    pbm_uoffset cap, mask, csz, fsz, io_len, start_mark, new_start_mark;
 
     /*                  start                   end                       *
      *                  |       start_mark      |       end_mark          *
@@ -194,13 +482,13 @@ static size_t pipe_buffer_read(pipe_buffer *pb, char *buf, size_t len)
 
     if (len == 0) return 0;
 
-    cap = (pb_uoffset)atomic_load_explicit(&pb->capacity, memory_order_relaxed);
+    cap = (pbm_uoffset)atomic_load_explicit(&pb->capacity, memory_order_relaxed);
     mask = cap - 1;
 
 retry:
     /* fetch buffer markers */
     pof_val = atomic_load_explicit(&pb->pof, memory_order_relaxed);
-    pof = pb_unpack_offsets(pof_val);
+    pof = pbm_unpack_offsets(pof_val);
 
     /* ensure buffer marker invariants */
     csz = pof.end - pof.start;
@@ -209,7 +497,7 @@ retry:
     assert(fsz <= cap);
 
     /* calculate copy length from start_mark to new_start_mark */
-    io_len = len < fsz ? (pb_uoffset)len : fsz;
+    io_len = len < fsz ? (pbm_uoffset)len : fsz;
     start_mark = pof.start_mark;
     new_start_mark = pof.start_mark + io_len;
 
@@ -222,15 +510,15 @@ retry:
      * due to buffer space invariant. uncontended if one reader/writer. */
     pof.start_mark = new_start_mark;
     if (!atomic_compare_exchange_strong(&pb->pof, &pof_val,
-        pb_pack_offsets(pof))) goto retry;
+        pbm_pack_offsets(pof))) goto retry;
 
     /* perform copy out, and if we wrap split into two copies
      * while also applying the modulus to the buffer markers. */
     if ((start_mark & ~mask) == ((new_start_mark - 1) & ~mask)) {
         memcpy(buf, pb->data + (start_mark & mask), io_len);
     } else {
-        pb_uoffset o1 = (start_mark & mask);
-        pb_uoffset l1 = (new_start_mark & ~mask) - start_mark;
+        pbm_uoffset o1 = (start_mark & mask);
+        pbm_uoffset l1 = (new_start_mark & ~mask) - start_mark;
         memcpy(buf, pb->data + o1, l1);
         memcpy(buf + l1, pb->data, io_len - l1);
     }
@@ -239,23 +527,22 @@ retry:
      * and store start <- new_start_mark. uncontended if one reader/writer. */
     for (;;) {
         pof_val = atomic_load_explicit(&pb->pof, memory_order_acquire);
-        pof = pb_unpack_offsets(pof_val);
+        pof = pbm_unpack_offsets(pof_val);
         pof.start = start_mark;
-        if (pof_val != pb_pack_offsets(pof)) continue;
-        pof_val = pb_pack_offsets(pof);
+        pof_val = pbm_pack_offsets(pof);
         pof.start = new_start_mark;
         if (atomic_compare_exchange_strong(&pb->pof, &pof_val,
-            pb_pack_offsets(pof))) break;
+            pbm_pack_offsets(pof))) break;
     }
 
     return io_len;
 }
 
-static size_t pipe_buffer_write(pipe_buffer *pb, char *buf, size_t len)
+static size_t pbm_buffer_write(pbm_buffer *pb, char *buf, size_t len)
 {
     ullong pof_val;
-    pb_offsets pof;
-    pb_uoffset cap, mask, csz, fsz, io_len, end_mark, new_end_mark;
+    pbm_offsets pof;
+    pbm_uoffset cap, mask, csz, fsz, io_len, end_mark, new_end_mark;
 
     /*                  start                   end                       *
      *                  |       start_mark      |       end_mark          *
@@ -267,13 +554,13 @@ static size_t pipe_buffer_write(pipe_buffer *pb, char *buf, size_t len)
 
     if (len == 0) return 0;
 
-    cap = (pb_uoffset)atomic_load_explicit(&pb->capacity, memory_order_relaxed);
+    cap = (pbm_uoffset)atomic_load_explicit(&pb->capacity, memory_order_relaxed);
     mask = cap - 1;
 
 retry:
     /* fetch buffer markers */
     pof_val = atomic_load_explicit(&pb->pof, memory_order_relaxed);
-    pof = pb_unpack_offsets(pof_val);
+    pof = pbm_unpack_offsets(pof_val);
 
     /* ensure buffer marker invariants */
     csz = pof.end - pof.start;
@@ -282,7 +569,7 @@ retry:
     assert(fsz <= cap);
 
     /* calculate copy length from end_mark to new_end_mark */
-    io_len = len < cap - fsz ? (pb_uoffset)len : cap - fsz;
+    io_len = len < cap - fsz ? (pbm_uoffset)len : cap - fsz;
     end_mark = pof.end_mark;
     new_end_mark = pof.end_mark + io_len;
 
@@ -295,15 +582,15 @@ retry:
      * due to buffer space invariant. uncontended if one reader/writer. */
     pof.end_mark = new_end_mark;
     if (!atomic_compare_exchange_strong(&pb->pof, &pof_val,
-        pb_pack_offsets(pof))) goto retry;
+        pbm_pack_offsets(pof))) goto retry;
 
     /* perform copy in, and if we wrap split into two copies
      * while also applying the modulus to the buffer markers. */
     if ((end_mark & ~mask) == ((new_end_mark - 1) & ~mask)) {
         memcpy(pb->data + (end_mark & mask), buf, io_len);
     } else {
-        pb_uoffset o1 = (end_mark & mask);
-        pb_uoffset l1 = (new_end_mark & ~mask) - end_mark;
+        pbm_uoffset o1 = (end_mark & mask);
+        pbm_uoffset l1 = (new_end_mark & ~mask) - end_mark;
         memcpy(pb->data + o1, buf, l1);
         memcpy(pb->data, buf + l1, io_len - l1);
     }
@@ -312,23 +599,22 @@ retry:
      * and store end <- new_end_mark. uncontended if one reader/writer. */
     for (;;) {
         pof_val = atomic_load_explicit(&pb->pof, memory_order_acquire);
-        pof = pb_unpack_offsets(pof_val);
+        pof = pbm_unpack_offsets(pof_val);
         pof.end = end_mark;
-        if (pof_val != pb_pack_offsets(pof)) continue;
-        pof_val = pb_pack_offsets(pof);
+        pof_val = pbm_pack_offsets(pof);
         pof.end = new_end_mark;
         if (atomic_compare_exchange_strong(&pb->pof, &pof_val,
-            pb_pack_offsets(pof))) break;
+            pbm_pack_offsets(pof))) break;
     }
 
     return io_len;
 }
 
-static io_span pipe_buffer_read_lock(pipe_buffer *pb, size_t len)
+static io_span pbm_buffer_read_lock(pbm_buffer *pb, size_t len)
 {
     ullong pof_val;
-    pb_offsets pof;
-    pb_uoffset cap, mask, csz, fsz, io_len, start_mark, new_start_mark;
+    pbm_offsets pof;
+    pbm_uoffset cap, mask, csz, fsz, io_len, start_mark, new_start_mark;
     io_span ticket = { 0, 0, 0 };
 
     /*                  start                   end                       *
@@ -341,13 +627,13 @@ static io_span pipe_buffer_read_lock(pipe_buffer *pb, size_t len)
 
     if (len == 0) return ticket;
 
-    cap = (pb_uoffset)atomic_load_explicit(&pb->capacity, memory_order_relaxed);
+    cap = (pbm_uoffset)atomic_load_explicit(&pb->capacity, memory_order_relaxed);
     mask = cap - 1;
 
 retry:
     /* fetch buffer markers */
     pof_val = atomic_load_explicit(&pb->pof, memory_order_relaxed);
-    pof = pb_unpack_offsets(pof_val);
+    pof = pbm_unpack_offsets(pof_val);
 
     /* ensure buffer marker invariants */
     csz = pof.end - pof.start;
@@ -356,7 +642,7 @@ retry:
     assert(fsz <= cap);
 
     /* calculate copy length from start_mark to new_start_mark */
-    io_len = len < fsz ? (pb_uoffset)len : fsz;
+    io_len = len < fsz ? (pbm_uoffset)len : fsz;
     start_mark = pof.start_mark;
     new_start_mark = pof.start_mark + io_len;
 
@@ -374,7 +660,7 @@ retry:
      * due to buffer space invariant. uncontended if one reader/writer. */
     pof.start_mark = new_start_mark;
     if (!atomic_compare_exchange_strong(&pb->pof, &pof_val,
-        pb_pack_offsets(pof))) goto retry;
+        pbm_pack_offsets(pof))) goto retry;
 
     ticket.buf = pb->data + (start_mark & mask);
     ticket.length = io_len;
@@ -383,11 +669,11 @@ retry:
     return ticket;
 }
 
-static io_span pipe_buffer_write_lock(pipe_buffer *pb, size_t len)
+static io_span pbm_buffer_write_lock(pbm_buffer *pb, size_t len)
 {
     ullong pof_val;
-    pb_offsets pof;
-    pb_uoffset cap, mask, csz, fsz, io_len, end_mark, new_end_mark;
+    pbm_offsets pof;
+    pbm_uoffset cap, mask, csz, fsz, io_len, end_mark, new_end_mark;
     io_span ticket = { 0, 0, 0 };
 
     /*                  start                   end                       *
@@ -400,13 +686,13 @@ static io_span pipe_buffer_write_lock(pipe_buffer *pb, size_t len)
 
     if (len == 0) return ticket;
 
-    cap = (pb_uoffset)atomic_load_explicit(&pb->capacity, memory_order_relaxed);
+    cap = (pbm_uoffset)atomic_load_explicit(&pb->capacity, memory_order_relaxed);
     mask = cap - 1;
 
 retry:
     /* fetch buffer markers */
     pof_val = atomic_load_explicit(&pb->pof, memory_order_relaxed);
-    pof = pb_unpack_offsets(pof_val);
+    pof = pbm_unpack_offsets(pof_val);
 
     /* ensure buffer marker invariants */
     csz = pof.end - pof.start;
@@ -415,7 +701,7 @@ retry:
     assert(fsz <= cap);
 
     /* calculate copy length from end_mark to new_end_mark */
-    io_len = len < cap - fsz ? (pb_uoffset)len : cap - fsz;
+    io_len = len < cap - fsz ? (pbm_uoffset)len : cap - fsz;
     end_mark = pof.end_mark;
     new_end_mark = pof.end_mark + io_len;
 
@@ -433,7 +719,7 @@ retry:
      * due to buffer space invariant. uncontended if one reader/writer. */
     pof.end_mark = new_end_mark;
     if (!atomic_compare_exchange_strong(&pb->pof, &pof_val,
-        pb_pack_offsets(pof))) goto retry;
+        pbm_pack_offsets(pof))) goto retry;
 
     ticket.buf = pb->data + (end_mark & mask);
     ticket.length = io_len;
@@ -442,66 +728,64 @@ retry:
     return ticket;
 }
 
-static int pipe_buffer_read_commit(pipe_buffer *pb, io_span ticket)
+static int pbm_buffer_read_commit(pbm_buffer *pb, io_span ticket)
 {
     ullong pof_val;
-    pb_offsets pof;
-    pb_uoffset start_mark, new_start_mark;
+    pbm_offsets pof;
+    pbm_uoffset start_mark, new_start_mark;
 
     if (ticket.length == 0) return 0;
 
-    start_mark = (pb_uoffset)ticket.sequence;
-    new_start_mark = (pb_uoffset)(ticket.sequence + ticket.length);
+    start_mark = (pbm_uoffset)ticket.sequence;
+    new_start_mark = (pbm_uoffset)(ticket.sequence + ticket.length);
 
     /* spin until start == start_mark for reads before us to complete
      * and store start <- new_start_mark. uncontended if one reader/writer. */
     for (;;) {
         pof_val = atomic_load_explicit(&pb->pof, memory_order_acquire);
-        pof = pb_unpack_offsets(pof_val);
+        pof = pbm_unpack_offsets(pof_val);
         pof.start = start_mark;
-        if (pof_val != pb_pack_offsets(pof)) continue;
-        pof_val = pb_pack_offsets(pof);
+        pof_val = pbm_pack_offsets(pof);
         pof.start = new_start_mark;
         if (atomic_compare_exchange_strong(&pb->pof, &pof_val,
-            pb_pack_offsets(pof))) break;
+            pbm_pack_offsets(pof))) break;
     }
 
     return 0;
 }
 
-static int pipe_buffer_write_commit(pipe_buffer *pb, io_span ticket)
+static int pbm_buffer_write_commit(pbm_buffer *pb, io_span ticket)
 {
     ullong pof_val;
-    pb_offsets pof;
-    pb_uoffset end_mark, new_end_mark;
+    pbm_offsets pof;
+    pbm_uoffset end_mark, new_end_mark;
 
     if (ticket.length == 0) return 0;
 
-    end_mark = (pb_uoffset)ticket.sequence;
-    new_end_mark = (pb_uoffset)(ticket.sequence + ticket.length);
+    end_mark = (pbm_uoffset)ticket.sequence;
+    new_end_mark = (pbm_uoffset)(ticket.sequence + ticket.length);
 
     /* spin until end == end_mark for writes before us to complete
      * and store end <- new_end_mark. uncontended if one reader/writer. */
     for (;;) {
         pof_val = atomic_load_explicit(&pb->pof, memory_order_acquire);
-        pof = pb_unpack_offsets(pof_val);
+        pof = pbm_unpack_offsets(pof_val);
         pof.end = end_mark;
-        if (pof_val != pb_pack_offsets(pof)) continue;
-        pof_val = pb_pack_offsets(pof);
+        pof_val = pbm_pack_offsets(pof);
         pof.end = new_end_mark;
         if (atomic_compare_exchange_strong(&pb->pof, &pof_val,
-            pb_pack_offsets(pof))) break;
+            pbm_pack_offsets(pof))) break;
     }
 
     return 0;
 }
 
-static io_buffer_ops pb_ops =
+static io_buffer_ops pbm_ops =
 {
-    (io_read_fn *)pipe_buffer_read,
-    (io_write_fn *)pipe_buffer_write,
-    (io_read_lock_fn *)pipe_buffer_read_lock,
-    (io_write_lock_fn *)pipe_buffer_write_lock,
-    (io_read_commit_fn *)pipe_buffer_read_commit,
-    (io_write_commit_fn *)pipe_buffer_write_commit
+    (io_read_fn *)pbm_buffer_read,
+    (io_write_fn *)pbm_buffer_write,
+    (io_read_lock_fn *)pbm_buffer_read_lock,
+    (io_write_lock_fn *)pbm_buffer_write_lock,
+    (io_read_commit_fn *)pbm_buffer_read_commit,
+    (io_write_commit_fn *)pbm_buffer_write_commit
 };
